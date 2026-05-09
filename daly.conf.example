@@ -1,0 +1,25 @@
+# Configuration for Daly BMS Monitoring Service
+
+[logging]
+level = "INFO"
+interval = 60  # seconds between polls
+
+[jsonl]
+enabled = true
+file_path = "./battery_data.jsonl"
+
+[influxdb]
+enabled = true
+url = "http://localhost:8086"
+token = "YOUR_INFLUX_TOKEN"
+org = "boat_systems"
+bucket = "power_telemetry"
+
+[[batteries]]
+name = "Hausbatterie"
+address = "AA:BB:CC:DD:EE:FF"
+
+# You can add more batteries by repeating this section
+# [[batteries]]
+# name = "Starterbatterie"
+# address = "11:22:33:44:55:66"

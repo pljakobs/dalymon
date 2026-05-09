@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+
+# Local runtime data
+battery_data.csv
+battery_data.jsonl
+
+# Generated plots/artifacts
+*.png
+
+# Local config (keep example only)
+daly.conf
