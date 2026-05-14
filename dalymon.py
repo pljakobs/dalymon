@@ -346,6 +346,9 @@ async def main(args):
         write_api = influx_client.write_api(write_options=SYNCHRONOUS)
 
     last_health_assessment = 0.0
+    poll_interval = config['logging']['interval']
+    
+    print(f"[main] Starting monitor loop with interval {poll_interval}s")
 
     try:
         while True:
@@ -360,7 +363,9 @@ async def main(args):
                 await run_health_assessment(config, write_api)
                 last_health_assessment = now
 
-            await asyncio.sleep(config['logging']['interval'])
+            print(f"[main] Sleeping for {poll_interval}s...")
+            await asyncio.sleep(poll_interval)
+            print(f"[main] Woke up, starting next cycle")
     finally:
         if jsonl_file is not None:
             jsonl_file.close()
