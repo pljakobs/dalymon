@@ -243,18 +243,24 @@ async def poll_bms(config, battery_conf, write_api, jsonl_file, write_to_file, w
     mac = battery_conf['address']
     name = battery_conf['name']
     retry_delay = INIT_RETRY_DELAY
+    
+    print(f"[{name}] Starting poll for {mac}")
 
     for attempt in range(1, MAX_RETRIES_PER_CYCLE + 1):
         try:
+            print(f"[{name}] Scanning for device (attempt {attempt}/{MAX_RETRIES_PER_CYCLE})...")
             device = await asyncio.wait_for(
                 BleakScanner.find_device_by_address(mac, timeout=SCAN_TIMEOUT),
                 timeout=SCAN_TIMEOUT + 2,
             )
+            print(f"[{name}] Device found: {device}")
             if not device:
                 raise RuntimeError("Device not found during scan")
 
             async with BMS(ble_device=device) as bms:
+                print(f"[{name}] Connected to BMS, fetching data...")
                 data = await asyncio.wait_for(bms.async_update(), timeout=UPDATE_TIMEOUT)
+                print(f"[{name}] Got BMS data: {data}")
                 timestamp = utc_now_iso_z()
 
                 # --- InfluxDB Export ---
@@ -335,15 +341,20 @@ async def main(args):
     if write_to_file:
         os.makedirs(os.path.dirname(config['jsonl']['file_path']) or '.', exist_ok=True)
         jsonl_file = open(config['jsonl']['file_path'], mode='a', encoding='utf-8')
+        print(f"[main] JSONL logging to: {config['jsonl']['file_path']}")
 
     # Setup Influx
     influx_client = None
     write_api = None
     if config['influxdb']['enabled']:
+        print(f"[main] Connecting to InfluxDB: {config['influxdb']['url']}")
         influx_client = InfluxDBClient(url=config['influxdb']['url'], 
                                        token=config['influxdb']['token'], 
                                        org=config['influxdb']['org'])
         write_api = influx_client.write_api(write_options=SYNCHRONOUS)
+        print(f"[main] InfluxDB connected, bucket: {config['influxdb']['bucket']}")
+    else:
+        print(f"[main] InfluxDB disabled")
 
     last_health_assessment = 0.0
     poll_interval = config['logging']['interval']
