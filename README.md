@@ -92,6 +92,21 @@ Shows:
 - estimated stationary load
 - detected high-load intervals
 
+## Health Assessment
+
+Run a preliminary health assessment with explicit data sufficiency warnings:
+
+- `python3 health_assessment.py`
+
+Includes:
+
+- load-step resistance proxies (pack/cell)
+- imbalance by SOC band
+- high-SOC first-hit cell behavior
+- thermal response proxy
+- rest-window/self-discharge checks
+- fault event counts
+
 ## Repository Notes
 
 Included:

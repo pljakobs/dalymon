@@ -14,3 +14,9 @@ battery_data.jsonl
 
 # Local config (keep example only)
 daly.conf
+admin-token.txt
+all-access-token.txt
+dalymon_token.txt
+
+# Accidentally created files
+udo systemctl start grafana

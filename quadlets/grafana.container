@@ -1,0 +1,19 @@
+[Unit]
+Description=Grafana analytics and monitoring platform
+After=network-online.target influxdb.service
+Wants=network-online.target
+
+[Container]
+Image=docker.io/grafana/grafana:latest
+ContainerName=grafana
+Environment=GF_SECURITY_ADMIN_PASSWORD=admin
+Environment=GF_SECURITY_ADMIN_USER=admin
+Environment=GF_INSTALL_PLUGINS=grafana-piechart-panel
+Environment=GF_PATHS_DATA=/var/lib/grafana
+Environment=GF_PATHS_LOGS=/var/lib/grafana/logs
+Environment=GF_PATHS_PLUGINS=/var/lib/grafana/plugins
+Volume=%h/.local/share/grafana/data:/var/lib/grafana:Z,U
+Network=host
+
+[Install]
+WantedBy=default.target

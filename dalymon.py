@@ -3,23 +3,243 @@ import argparse
 import tomllib
 import json
 import os
+import time
 from datetime import datetime, timezone
 from bleak import BleakScanner
 from aiobmsble.bms.daly_bms import BMS
 from influxdb_client import InfluxDBClient, Point
-from influxdb_client.client.write_api import ASYNCHRONOUS
+from influxdb_client.client.write_api import SYNCHRONOUS
+from health_assessment import assess
 
 MAX_RETRY_DELAY = 300       # cap backoff at 5 minutes
 INIT_RETRY_DELAY = 10       # first retry wait in seconds
 MAX_RETRIES_PER_CYCLE = 4   # prevent one battery from blocking the full cycle
 SCAN_TIMEOUT = 10           # BLE scan timeout in seconds
 UPDATE_TIMEOUT = 20         # BMS update timeout in seconds
+HEALTH_ASSESSMENT_INTERVAL_S = 3600
+HEALTH_LOOKBACK_DAYS = 365
+HEALTH_TOKEN_FILE = "dalymon_token.txt"
 
 
 def utc_now_iso_z() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-async def poll_bms(config, battery_conf, influx_client, jsonl_file, write_to_file, write_to_stdout):
+
+def add_telemetry_fields(point: Point, data: dict) -> Point:
+    """Map full Daly payload to Influx fields with safe type handling."""
+    for key, value in data.items():
+        if value is None:
+            continue
+
+        if isinstance(value, bool):
+            point = point.field(key, value)
+            continue
+
+        if isinstance(value, (int, float)):
+            point = point.field(key, float(value))
+            continue
+
+        if isinstance(value, list):
+            # Flatten per-cell and per-sensor arrays to queryable scalar fields.
+            if key == "cell_voltages":
+                for idx, cell_v in enumerate(value, start=1):
+                    try:
+                        point = point.field(f"cell_voltage_{idx}", float(cell_v))
+                    except (TypeError, ValueError):
+                        continue
+            elif key == "temp_values":
+                for idx, temp_v in enumerate(value, start=1):
+                    try:
+                        point = point.field(f"temp_value_{idx}", float(temp_v))
+                    except (TypeError, ValueError):
+                        continue
+
+    # Keep legacy aliases used by existing panels.
+    if "battery_level" in data:
+        try:
+            point = point.field("soc", float(data["battery_level"]))
+        except (TypeError, ValueError):
+            pass
+    if "temperature" in data:
+        try:
+            point = point.field("temp", float(data["temperature"]))
+        except (TypeError, ValueError):
+            pass
+
+    return point
+
+
+def add_health_fields(point: Point, metrics: dict, warnings_count: int, remarks_count: int) -> Point:
+    """Write a compact set of health metrics for dashboarding/trending."""
+    numeric_fields = [
+        "samples",
+        "time_span_hours",
+        "time_span_days",
+        "step_events",
+        "pack_ir_proxy_median_mohm",
+        "cell_ir_proxy_median_mohm",
+        "delta_v_median_low_soc_v",
+        "delta_v_median_mid_soc_v",
+        "delta_v_median_high_soc_v",
+        "high_soc_samples",
+        "temp_median_low_load_c",
+        "temp_median_high_load_c",
+        "temp_rise_proxy_c",
+        "rest_windows",
+        "rest_voltage_drift_median_v",
+        "fault_events",
+        "soc_span_pct",
+    ]
+
+    for key in numeric_fields:
+        value = metrics.get(key)
+        if isinstance(value, (int, float)):
+            point = point.field(key, float(value))
+
+    low_cell = metrics.get("most_frequent_low_cell_at_high_soc")
+    high_cell = metrics.get("most_frequent_high_cell_at_high_soc")
+    if isinstance(low_cell, tuple) and len(low_cell) == 2:
+        point = point.field("frequent_low_cell_idx", int(low_cell[0]))
+        point = point.field("frequent_low_cell_count", int(low_cell[1]))
+    if isinstance(high_cell, tuple) and len(high_cell) == 2:
+        point = point.field("frequent_high_cell_idx", int(high_cell[0]))
+        point = point.field("frequent_high_cell_count", int(high_cell[1]))
+
+    per_cell_ir = metrics.get("cell_ir_proxy_median_mohm_by_cell") or {}
+    if isinstance(per_cell_ir, dict):
+        for idx, ir in per_cell_ir.items():
+            if isinstance(idx, int) and isinstance(ir, (int, float)):
+                point = point.field(f"cell_ir_proxy_median_mohm_{idx}", float(ir))
+
+    point = point.field("warnings_count", int(warnings_count))
+    point = point.field("remarks_count", int(remarks_count))
+    return point
+
+
+def read_health_token(config: dict) -> str:
+    """Load read token for health queries, preferring dalymon_token.txt."""
+    if os.path.exists(HEALTH_TOKEN_FILE):
+        with open(HEALTH_TOKEN_FILE, encoding="utf-8") as f:
+            token = f.read().strip()
+            if token:
+                return token
+    return config["influxdb"]["token"]
+
+
+def load_rows_from_influx(config: dict) -> list[dict]:
+    """Load historical battery rows from InfluxDB and shape for assess()."""
+    def as_float(value, default=float("nan")):
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def as_int(value, default=0):
+        try:
+            if value is None:
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            return default
+
+    battery_name = config["batteries"][0]["name"]
+    flux = f'''
+from(bucket: {json.dumps(config["influxdb"]["bucket"] )})
+  |> range(start: -{HEALTH_LOOKBACK_DAYS}d)
+  |> filter(fn: (r) => r._measurement == "battery_status")
+  |> filter(fn: (r) => r.battery_name == {json.dumps(battery_name)})
+  |> filter(fn: (r) =>
+      r._field == "voltage" or
+      r._field == "current" or
+      r._field == "battery_level" or
+      r._field == "delta_voltage" or
+      r._field == "temperature" or
+      r._field == "problem_code" or
+      r._field == "problem" or
+      r._field =~ /^cell_voltage_[0-9]+$/
+  )
+  |> pivot(rowKey: ["_time"], columnKey: ["_field"], valueColumn: "_value")
+  |> sort(columns: ["_time"])
+'''
+
+    token = read_health_token(config)
+    rows: list[dict] = []
+    with InfluxDBClient(
+        url=config["influxdb"]["url"],
+        token=token,
+        org=config["influxdb"]["org"],
+    ) as client:
+        query_api = client.query_api()
+        for record in query_api.query_stream(query=flux, org=config["influxdb"]["org"]):
+            ts = record.get_time()
+            if ts is None:
+                continue
+            values = record.values
+            row = {
+                "timestamp": ts.astimezone(timezone.utc).isoformat().replace("+00:00", "Z"),
+                "_ts": ts.astimezone(timezone.utc),
+                "battery": battery_name,
+                "voltage": as_float(values.get("voltage"), 0.0),
+                "current": as_float(values.get("current"), 0.0),
+                "battery_level": as_float(values.get("battery_level"), float("nan")),
+                "delta_voltage": as_float(values.get("delta_voltage"), float("nan")),
+                "temperature": as_float(values.get("temperature"), float("nan")),
+                "problem_code": as_int(values.get("problem_code"), 0),
+                "problem": bool(values.get("problem", False)),
+            }
+
+            # Reconstruct per-cell array from flattened fields.
+            cell_pairs = []
+            for key, value in values.items():
+                if isinstance(key, str) and key.startswith("cell_voltage_"):
+                    try:
+                        idx = int(key.split("_")[-1])
+                        if value is None:
+                            continue
+                        cell_pairs.append((idx, float(value)))
+                    except (ValueError, TypeError):
+                        continue
+            if cell_pairs:
+                row["cell_voltages"] = [v for _, v in sorted(cell_pairs)]
+            else:
+                row["cell_voltages"] = []
+
+            rows.append(row)
+
+    rows.sort(key=lambda r: r["_ts"])
+    return rows
+
+
+async def run_health_assessment(config, write_api):
+    """Compute health summary from JSONL history and write to InfluxDB."""
+    if write_api is None:
+        return
+
+    try:
+        rows = await asyncio.to_thread(load_rows_from_influx, config)
+        if not rows:
+            print("[health] No rows available in InfluxDB for assessment")
+            return
+        result = assess(rows)
+        metrics = result.get("metrics", {})
+        warnings_count = len(result.get("warnings", []))
+        remarks_count = len(result.get("remarks", []))
+
+        point = Point("battery_health").tag("battery_name", config["batteries"][0]["name"])
+        point = add_health_fields(point, metrics, warnings_count, remarks_count)
+        write_api.write(
+            bucket=config["influxdb"]["bucket"],
+            org=config["influxdb"]["org"],
+            record=point,
+        )
+        print("[health] Wrote battery health summary to InfluxDB")
+    except Exception as e:
+        print(f"[health] Assessment failed: {e}")
+
+
+async def poll_bms(config, battery_conf, write_api, jsonl_file, write_to_file, write_to_stdout):
     mac = battery_conf['address']
     name = battery_conf['name']
     retry_delay = INIT_RETRY_DELAY
@@ -38,15 +258,10 @@ async def poll_bms(config, battery_conf, influx_client, jsonl_file, write_to_fil
                 timestamp = utc_now_iso_z()
 
                 # --- InfluxDB Export ---
-                if config['influxdb']['enabled']:
-                    point = Point("battery_status") \
-                        .tag("battery_name", name) \
-                        .field("voltage", float(data.get('voltage', 0))) \
-                        .field("current", float(data.get('current', 0))) \
-                        .field("soc", float(data.get('battery_level', 0))) \
-                        .field("temp", float(data.get('temperature', 0)))
+                if config['influxdb']['enabled'] and write_api is not None:
+                    point = Point("battery_status").tag("battery_name", name)
+                    point = add_telemetry_fields(point, data)
 
-                    write_api = influx_client.write_api(write_options=ASYNCHRONOUS)
                     write_api.write(bucket=config['influxdb']['bucket'],
                                     org=config['influxdb']['org'],
                                     record=point)
@@ -117,17 +332,34 @@ async def main(args):
 
     # Setup Influx
     influx_client = None
+    write_api = None
     if config['influxdb']['enabled']:
         influx_client = InfluxDBClient(url=config['influxdb']['url'], 
                                        token=config['influxdb']['token'], 
                                        org=config['influxdb']['org'])
+        write_api = influx_client.write_api(write_options=SYNCHRONOUS)
 
-    while True:
-        # Create tasks for all batteries to poll in parallel
-        tasks = [poll_bms(config, b, influx_client, jsonl_file, write_to_file, write_to_stdout)
-                 for b in config['batteries']]
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await asyncio.sleep(config['logging']['interval'])
+    last_health_assessment = 0.0
+
+    try:
+        while True:
+            # Create tasks for all batteries to poll in parallel
+            tasks = [poll_bms(config, b, write_api, jsonl_file, write_to_file, write_to_stdout)
+                     for b in config['batteries']]
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+            # Run heavier health assessment periodically (default: hourly).
+            now = time.monotonic()
+            if now - last_health_assessment >= HEALTH_ASSESSMENT_INTERVAL_S:
+                await run_health_assessment(config, write_api)
+                last_health_assessment = now
+
+            await asyncio.sleep(config['logging']['interval'])
+    finally:
+        if jsonl_file is not None:
+            jsonl_file.close()
+        if influx_client is not None:
+            influx_client.close()
 
 if __name__ == "__main__":
     args = parse_args()

@@ -1,0 +1,17 @@
+[Unit]
+Description=InfluxDB time series database
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=docker.io/library/influxdb:latest
+ContainerName=influxdb
+Environment=INFLUXDB_DB=battery_data
+Environment=INFLUXDB_ADMIN_USER=admin
+Environment=INFLUXDB_ADMIN_PASSWORD=adminpassword
+Environment=INFLUXDB_HTTP_AUTH_ENABLED=true
+Volume=%h/.local/share/influxdb:/var/lib/influxdb:Z
+Network=host
+
+[Install]
+WantedBy=default.target

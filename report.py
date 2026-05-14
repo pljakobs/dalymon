@@ -23,7 +23,11 @@ def load_rows(path: str) -> list[dict]:
 
 
 def ts(s: str) -> datetime:
-    return datetime.fromisoformat(s)
+    # Support both legacy naive timestamps and newer UTC Z timestamps.
+    dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
 
 
 def build_intervals(rows: list[dict]) -> list[dict]:
