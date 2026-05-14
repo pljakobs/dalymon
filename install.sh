@@ -1,13 +1,16 @@
 #!/bin/bash
 # Installer for the Daly BMS monitor service
-# Installs Python files, creates a config, and sets up a systemd user service.
+# Installs Python files, creates a config, and sets up a systemd system service.
+# Requires sudo for writing the service file to /etc/systemd/system/.
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-INSTALL_DIR="${DALYMON_INSTALL_DIR:-$HOME/.local/lib/dalymon}"
-CONFIG_DIR="$HOME/.config/dalymon"
-SERVICE_FILE="$HOME/.config/systemd/user/dalymon.service"
+RUN_USER="${SUDO_USER:-$(id -un)}"
+RUN_HOME=$(eval echo "~$RUN_USER")
+INSTALL_DIR="${DALYMON_INSTALL_DIR:-$RUN_HOME/.local/lib/dalymon}"
+CONFIG_FILE="/etc/dalymon.conf"
+SERVICE_FILE="/etc/systemd/system/dalymon.service"
 VENV_DIR="$INSTALL_DIR/.venv"
 PYTHON="python3"
 
@@ -75,7 +78,7 @@ echo ""
 # ── gather battery info ───────────────────────────────────────────────────────
 
 echo "$(bold 'Battery configuration')"
-echo "  (You can add more batteries by editing $CONFIG_DIR/daly.conf after install)"
+echo "  (You can add more batteries by editing $CONFIG_FILE after install)"
 echo ""
 ask        BATTERY_NAME    "Battery name"     "Hausbatterie"
 ask_bt_address BATTERY_ADDR "Bluetooth address (AA:BB:CC:DD:EE:FF)"
@@ -85,9 +88,10 @@ echo ""
 # ── confirm ───────────────────────────────────────────────────────────────────
 
 echo "$(bold 'Installation plan')"
+echo "  Running as user   : $RUN_USER"
 echo "  Install directory : $INSTALL_DIR"
-echo "  Config directory  : $CONFIG_DIR"
-echo "  Systemd service   : $SERVICE_FILE"
+  echo "  Config file       : $CONFIG_FILE  (requires sudo)"
+echo "  Systemd service   : $SERVICE_FILE  (requires sudo)"
 echo "  InfluxDB URL      : $INFLUX_URL"
 echo "  InfluxDB org      : $INFLUX_ORG"
 echo "  InfluxDB bucket   : $INFLUX_BUCKET"
@@ -100,6 +104,12 @@ case "${yn:-Y}" in
     *) echo "Aborted."; exit 0 ;;
 esac
 echo ""
+
+# ── require root early (needed for /etc/ and /etc/systemd/) ─────────────────
+
+if [[ $EUID -ne 0 ]]; then
+    die "This installer writes to /etc/ and requires root. Please re-run with: sudo bash $0"
+fi
 
 # ── install Python files ──────────────────────────────────────────────────────
 
@@ -117,6 +127,9 @@ PYTHON_FILES=(
 
 for f in "${PYTHON_FILES[@]}"; do
     if [[ -f "$SCRIPT_DIR/$f" ]]; then
+        if [[ -f "$INSTALL_DIR/$f" ]]; then
+            warn "$f already installed – overwriting"
+        fi
         install -m 644 "$SCRIPT_DIR/$f" "$INSTALL_DIR/"
         ok "Installed $f"
     else
@@ -141,13 +154,9 @@ ok "Dependencies installed"
 
 # ── write config ──────────────────────────────────────────────────────────────
 
-mkdir -p "$CONFIG_DIR"
-CONFIG_FILE="$CONFIG_DIR/daly.conf"
-
 if [[ -f "$CONFIG_FILE" ]]; then
-    warn "Config already exists at $CONFIG_FILE – backing up to ${CONFIG_FILE}.bak"
-    cp "$CONFIG_FILE" "${CONFIG_FILE}.bak"
-fi
+    warn "Config already exists at $CONFIG_FILE – skipping (delete it to reconfigure)"
+else
 
 cat > "$CONFIG_FILE" <<TOML
 # Daly BMS Monitor configuration
@@ -179,56 +188,55 @@ address = "$BATTERY_ADDR"
 TOML
 
 chmod 600 "$CONFIG_FILE"   # token is sensitive
-ok "Config written to $CONFIG_FILE (mode 600)"
+    ok "Config written to $CONFIG_FILE (mode 600)"
+fi  # end of config-not-exists block
 
-# ── systemd user service ──────────────────────────────────────────────────────
+# ── systemd system service ────────────────────────────────────────────────────
 
-mkdir -p "$HOME/.config/systemd/user"
+if [[ -f "$SERVICE_FILE" ]]; then
+    warn "Service file already exists at $SERVICE_FILE – skipping (delete to reinstall)"
+else
 
 cat > "$SERVICE_FILE" <<UNIT
 [Unit]
 Description=Daly BMS BLE monitoring daemon
-After=network.target
-Wants=network.target
+After=network.target bluetooth.target
+Wants=network.target bluetooth.target
 
 [Service]
 Type=simple
-WorkingDirectory=$CONFIG_DIR
-ExecStart=$VENV_DIR/bin/python $INSTALL_DIR/dalymon.py
+User=$RUN_USER
+ExecStart=$VENV_DIR/bin/python $INSTALL_DIR/dalymon.py --config $CONFIG_FILE
 Restart=on-failure
 RestartSec=30
-# Keep the config readable
 UMask=0077
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target
 UNIT
 
 ok "Systemd service installed at $SERVICE_FILE"
-
-# ── symlink config into install dir so dalymon.py finds it ───────────────────
-# dalymon.py opens "daly.conf" relative to cwd; the service sets WorkingDirectory
-# to $CONFIG_DIR, so no symlink is needed.  But mention the cwd clearly.
+fi  # end of service-not-exists block
 
 # ── enable & start ────────────────────────────────────────────────────────────
 
 echo ""
-systemctl --user daemon-reload
+systemctl daemon-reload
 echo ""
 read -rp "  Enable and start the dalymon service now? [Y/n] " yn_start
 case "${yn_start:-Y}" in
     [Yy]*)
-        systemctl --user enable --now dalymon
+        systemctl enable --now dalymon
         echo ""
         ok "Service enabled and started"
         echo ""
-        echo "  Check status : systemctl --user status dalymon"
-        echo "  Follow logs  : journalctl --user-unit dalymon -f"
+        echo "  Check status : systemctl status dalymon"
+        echo "  Follow logs  : journalctl -u dalymon -f"
         ;;
     *)
         echo ""
         info "To start the service manually:"
-        echo "    systemctl --user enable --now dalymon"
+        echo "    sudo systemctl enable --now dalymon"
         ;;
 esac
 
@@ -237,5 +245,5 @@ echo "$(bold '✓ Installation complete')"
 echo ""
 echo "  Config file  : $CONFIG_FILE"
 echo "  Install dir  : $INSTALL_DIR"
-echo "  Service      : systemctl --user status dalymon"
+echo "  Service      : systemctl status dalymon"
 echo ""

@@ -297,6 +297,12 @@ async def poll_bms(config, battery_conf, write_api, jsonl_file, write_to_file, w
 def parse_args():
     parser = argparse.ArgumentParser(description="Daly BMS monitoring daemon")
     parser.add_argument(
+        "-c",
+        "--config",
+        default="daly.conf",
+        help="Path to the TOML config file (default: daly.conf in cwd, system install: /etc/dalymon.conf)",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         choices=["auto", "file", "stdout", "both"],
@@ -307,7 +313,7 @@ def parse_args():
 
 
 async def main(args):
-    with open("daly.conf", "rb") as f:
+    with open(args.config, "rb") as f:
         config = tomllib.load(f)
 
     config_file_output = config.get('jsonl', {}).get('enabled', False)
