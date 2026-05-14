@@ -1,4 +1,3 @@
 bleak
 aiobmsble
 influxdb-client
-matplotlib
